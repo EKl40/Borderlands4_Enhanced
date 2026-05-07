@@ -6,9 +6,6 @@ readme = "README.md"
 authors = [
     { name = "Renil" },
 ]
-dependencies = [
-    "oak2_mod_manager",
-]
 
 [tool.sdkmod]
 name = "BL4 Third Person Camera"

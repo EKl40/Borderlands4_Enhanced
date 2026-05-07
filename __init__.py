@@ -38,7 +38,6 @@ if True:
     assert __import__("mods_base").__version_info__ >= (1, 11), "Please update mods_base"
     assert __import__("unrealsdk").__version_info__ >= (1, 3, 0), "Please update unrealsdk"
     assert Game.get_current() == Game.BL4, "This mod only supports Borderlands 4"
-    __import__("oak2_mod_manager")
 
 __author__ = "Renil"
 __version__ = "0.1.0"
