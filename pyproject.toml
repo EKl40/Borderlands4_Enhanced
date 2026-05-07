@@ -1,0 +1,17 @@
+[project]
+name = "bl4_third_person_camera"
+version = "0.1.0"
+description = "Borderlands 4 third-person and over-shoulder camera controls implemented as a Python SDK mod with custom AOB scanning."
+readme = "README.md"
+authors = [
+    { name = "Renil" },
+]
+dependencies = [
+    "oak2_mod_manager",
+]
+
+[tool.sdkmod]
+name = "BL4 Third Person Camera"
+version = "0.1.0"
+supported_games = ["BL4"]
+coop_support = "ClientSide"
