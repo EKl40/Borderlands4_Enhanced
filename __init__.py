@@ -300,7 +300,7 @@ class CameraController:
             ctypes.c_longlong,
             ctypes.c_longlong,
             ctypes.c_longlong,
-            ctypes.c_longlong,
+            ctypes.c_float,
             ctypes.c_int,
             ctypes.c_ubyte,
         )
@@ -320,7 +320,6 @@ class CameraController:
         def commit_callback(a1: int, mode_ptr: int, transition_ptr: int, a4: int, a5: int, a6: int) -> int:
             try:
                 if mode_ptr and (not self._is_camera_override_blocked()) and self._should_hold_third_person():
-                    # 直接拦截函数的执行，跳过原模式切换代码
                     return 0
                 return int(self.commit_original(a1, mode_ptr, transition_ptr, a4, a5, a6)) if self.commit_original else 0
             except Exception:
@@ -350,7 +349,7 @@ class CameraController:
             ctypes.c_longlong,
             ctypes.c_longlong,
             ctypes.c_longlong,
-            ctypes.c_longlong,
+            ctypes.c_float,
             ctypes.c_int,
             ctypes.c_ubyte,
         )
