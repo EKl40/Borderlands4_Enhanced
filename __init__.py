@@ -17,21 +17,17 @@ from mods_base import (
     keybind,
 )
 from unrealsdk import find_enum, logging
-from unrealsdk.unreal import WeakPointer, WrappedStruct
+from unrealsdk.unreal import WeakPointer
 
 from .native import (
-    FNameRaw,
     InlineHook,
-    POINT,
     Pose,
     aob_scan,
     scan_diagnostics,
     read_double,
     read_float,
-    read_fname,
     write_double,
     write_float,
-    write_fname,
 )
 
 if True:
@@ -111,7 +107,6 @@ class CameraController:
         self.third_person = BoolOption("third_person", True, display_name="Third Person")
         self.over_shoulder = BoolOption("over_shoulder", True, display_name="Over Shoulder")
         self.right_shoulder = BoolOption("right_shoulder", True, display_name="Right Shoulder")
-        self.freecam = BoolOption("freecam", False, display_name="Freecam")
         self.enable_fov = BoolOption("enable_fov", False, display_name="Enable FOV")
         self.fov = SliderOption("fov", 100.0, 60.0, 180.0, step=1.0, is_integer=False, display_name="FOV")
         self.ads_fov_scale = SliderOption(
@@ -156,65 +151,19 @@ class CameraController:
             is_integer=False,
             display_name="OTS ADS Blend Time",
         )
-        self.freecam_speed = SliderOption(
-            "freecam_speed",
-            20.0,
-            1.0,
-            100.0,
-            step=1.0,
-            is_integer=False,
-            display_name="Freecam Speed",
-        )
-        self.freecam_boost = SliderOption(
-            "freecam_boost",
-            3.0,
-            1.0,
-            10.0,
-            step=0.1,
-            is_integer=False,
-            display_name="Freecam Boost",
-        )
-        self.mouse_sensitivity = SliderOption(
-            "mouse_sensitivity",
-            0.12,
-            0.01,
-            1.0,
-            step=0.01,
-            is_integer=False,
-            display_name="Freecam Mouse Sensitivity",
-        )
-
-        @self.third_person
-        def _third_person_changed(_: BoolOption, value: bool) -> None:
-            if value:
-                self.freecam.value = False
 
         @self.over_shoulder
         def _over_shoulder_changed(_: BoolOption, value: bool) -> None:
             if value:
                 self.third_person.value = True
-                self.freecam.value = False
-
-        @self.freecam
-        def _freecam_changed(_: BoolOption, value: bool) -> None:
-            if value:
-                self.third_person.value = False
-                self.over_shoulder.value = False
 
         self.smoothed_ots_ads_blend = 0.0
         self.native_ots_blend_alpha = 0.0
-        self.freecam_rotation_initialized = False
-        self.freecam_rotation = [0.0, 0.0, 0.0]
-        self.freecam_pose: Pose | None = None
-        self.last_cursor_position: tuple[int, int] | None = None
         self.last_transition_time = 0.0
         self.last_desired_third_person = False
         self.requested_first_person = False
         self.requested_third_person = False
         self.override_temporarily_blocked = False
-        self.transition_fname_third_person: FNameRaw | None = None
-        self.transition_fname_first_person: FNameRaw | None = None
-        self.transition_fname_default: FNameRaw | None = None
         self.update_hook: InlineHook | None = None
         self.commit_hook: InlineHook | None = None
         self.update_callback = None
@@ -255,16 +204,7 @@ class CameraController:
                 self.ots_ads_blend_time,
             ],
         )
-        freecam = GroupedOption(
-            "Freecam",
-            [
-                self.freecam,
-                self.freecam_speed,
-                self.freecam_boost,
-                self.mouse_sensitivity,
-            ],
-        )
-        return [camera_core, ots, freecam]
+        return [camera_core, ots]
 
     def enable(self) -> None:
         self._refresh_runtime_refs()
@@ -273,7 +213,6 @@ class CameraController:
     def disable(self) -> None:
         self.third_person.value = False
         self.over_shoulder.value = False
-        self.freecam.value = False
         self.requested_first_person = False
         self.requested_third_person = False
         self.uninstall_native_hooks()
@@ -284,10 +223,6 @@ class CameraController:
     def _reset_runtime_state(self) -> None:
         self.smoothed_ots_ads_blend = 0.0
         self.native_ots_blend_alpha = 0.0
-        self.freecam_rotation_initialized = False
-        self.freecam_rotation = [0.0, 0.0, 0.0]
-        self.freecam_pose = None
-        self.last_cursor_position = None
         self.last_desired_third_person = False
         self.requested_first_person = False
         self.requested_third_person = False
@@ -385,11 +320,8 @@ class CameraController:
         def commit_callback(a1: int, mode_ptr: int, transition_ptr: int, a4: int, a5: int, a6: int) -> int:
             try:
                 if mode_ptr and (not self._is_camera_override_blocked()) and self._should_hold_third_person():
-                    self._ensure_transition_fnames()
-                    if self.transition_fname_third_person is not None:
-                        current_mode = read_fname(mode_ptr)
-                        if current_mode is None or not self._fname_equals(current_mode, self.transition_fname_third_person):
-                            write_fname(mode_ptr, self.transition_fname_third_person)
+                    # 直接拦截函数的执行，跳过原模式切换代码
+                    return 0
                 return int(self.commit_original(a1, mode_ptr, transition_ptr, a4, a5, a6)) if self.commit_original else 0
             except Exception:
                 logging.error("[BL4 Third Person Camera] NativeCameraModeCommit callback failed")
@@ -438,14 +370,29 @@ class CameraController:
         self.update_original = None
         self.commit_original = None
 
+    def _wrapped_camera_transition(self, pc, new_mode: str, transition: str = "Default", blend_time: float = 0.15, arg4: bool = False, arg5: bool = False) -> None:
+        """
+        Wraps pc.CameraTransition to ensure the native commit hook is temporarily uninstalled
+        while the transition processes. Prevents unexpected hook override states.
+        """
+        was_installed = False
+        if self.commit_hook is not None and self.commit_hook.installed:
+            self.commit_hook.uninstall()
+            was_installed = True
+
+        try:
+            pc.CameraTransition(new_mode, transition, blend_time, arg4, arg5)
+        except Exception:
+            pass
+        finally:
+            if was_installed and self.commit_hook is not None:
+                self.commit_hook.install()
+
     def _best_effort_force_first_person(self) -> None:
         pc = self._get_pc()
         if pc is None:
             return
-        try:
-            pc.CameraTransition("FirstPerson", "Default", 0.15, False, False)
-        except Exception:
-            pass
+        self._wrapped_camera_transition(pc, "FirstPerson", "Default", 0.15, False, False)
 
     def _get_pc(self):
         if self.pc_ref is not None:
@@ -574,7 +521,6 @@ class CameraController:
     def _should_hold_third_person(self) -> bool:
         if (
             not self.third_person.value
-            or self.freecam.value
             or self.requested_first_person
             or self._is_camera_override_blocked()
         ):
@@ -598,7 +544,6 @@ class CameraController:
         if (
             not self.third_person.value
             or not self.over_shoulder.value
-            or self.freecam.value
             or self._is_camera_override_blocked()
         ):
             return False
@@ -612,40 +557,6 @@ class CameraController:
             return camera_manager.ViewTarget.target == character
         except Exception:
             return False
-
-    def _fname_equals(self, left: FNameRaw, right: FNameRaw) -> bool:
-        return left.comparison_index == right.comparison_index and left.number == right.number
-
-    def _ensure_transition_fnames(self) -> None:
-        if (
-            self.transition_fname_third_person is not None
-            and self.transition_fname_first_person is not None
-            and self.transition_fname_default is not None
-        ):
-            return
-        pc = self._get_pc()
-        if pc is None:
-            return
-        try:
-            func = pc.CameraTransition.func
-            params = WrappedStruct(func)
-            for field_name, literal, attr_name in (
-                ("NewMode", "ThirdPerson", "transition_fname_third_person"),
-                ("Transition", "Default", "transition_fname_default"),
-            ):
-                setattr(params, field_name, literal)
-                prop = func._find_prop(field_name)
-                raw = FNameRaw.from_buffer_copy(ctypes.string_at(params._get_address() + prop.Offset_Internal, ctypes.sizeof(FNameRaw)))
-                setattr(self, attr_name, raw)
-            params = WrappedStruct(func)
-            setattr(params, "NewMode", "FirstPerson")
-            prop = func._find_prop("NewMode")
-            self.transition_fname_first_person = FNameRaw.from_buffer_copy(
-                ctypes.string_at(params._get_address() + prop.Offset_Internal, ctypes.sizeof(FNameRaw))
-            )
-        except Exception:
-            logging.error("[BL4 Third Person Camera] Failed to capture FName transition literals")
-            logging.dev_warning(traceback.format_exc())
 
     def _get_current_ots_ads_blend(self) -> float:
         if not self.ots_ads_override.value:
@@ -845,14 +756,11 @@ class CameraController:
         camera_manager = self._get_camera_manager()
         character = self._get_character()
         if pc is None or camera_manager is None or character is None:
-            self.freecam_pose = None
             return
 
         if self._is_camera_override_blocked():
             self.smoothed_ots_ads_blend = 0.0
             self.native_ots_blend_alpha = 0.0
-            self.freecam_pose = None
-            self.freecam_rotation_initialized = False
             self.requested_first_person = False
             self.requested_third_person = False
             self.last_desired_third_person = False
@@ -864,16 +772,8 @@ class CameraController:
         self.override_temporarily_blocked = False
 
         is_zooming = self._is_zooming_now()
-        use_freecam = self.freecam.value
         use_ots = self.third_person.value and self.over_shoulder.value
         use_third_person = self.third_person.value
-
-        if use_freecam:
-            self.smoothed_ots_ads_blend = 0.0
-            self.requested_first_person = False
-            self.requested_third_person = False
-            self.last_desired_third_person = False
-            return
 
         should_be_third_person = use_third_person
         if use_ots and is_zooming and self.ots_ads_override.value and self.ots_ads_first_person.value:
@@ -894,98 +794,20 @@ class CameraController:
 
         changed = should_be_third_person != self.last_desired_third_person
         if changed and (_now() - self.last_transition_time > 0.2):
-            try:
-                pc.CameraTransition("ThirdPerson" if should_be_third_person else "FirstPerson", "Default", 0.15, False, False)
-                self.last_transition_time = _now()
-                self.requested_third_person = should_be_third_person
-                self.requested_first_person = not should_be_third_person
-            except Exception:
-                pass
+            self._wrapped_camera_transition(pc, "ThirdPerson" if should_be_third_person else "FirstPerson", "Default", 0.15, False, False)
+            self.last_transition_time = _now()
+            self.requested_third_person = should_be_third_person
+            self.requested_first_person = not should_be_third_person
         elif not changed:
             self.requested_third_person = False
             self.requested_first_person = False
         self.last_desired_third_person = should_be_third_person
-
-    def _update_freecam_pose(self, fallback: Pose) -> Pose:
-        if self.freecam_pose is None:
-            self.freecam_pose = Pose(
-                fallback.loc_x,
-                fallback.loc_y,
-                fallback.loc_z,
-                fallback.pitch,
-                fallback.yaw,
-                fallback.roll,
-                self._get_applied_fov(False),
-            )
-        pose = self.freecam_pose
-        user32 = ctypes.windll.user32
-        if not self.freecam_rotation_initialized:
-            self.freecam_rotation = [pose.pitch, pose.yaw, pose.roll]
-            self.freecam_rotation_initialized = True
-        point = POINT()
-        if user32.GetCursorPos(ctypes.byref(point)):
-            current_cursor = (int(point.x), int(point.y))
-            if self.last_cursor_position is not None:
-                delta_x = current_cursor[0] - self.last_cursor_position[0]
-                delta_y = current_cursor[1] - self.last_cursor_position[1]
-                self.freecam_rotation[1] += float(delta_x) * self.mouse_sensitivity.value
-                self.freecam_rotation[0] = _clamp(
-                    self.freecam_rotation[0] - (float(delta_y) * self.mouse_sensitivity.value),
-                    -89.0,
-                    89.0,
-                )
-            self.last_cursor_position = current_cursor
-        else:
-            self.last_cursor_position = None
-        pose.pitch = self.freecam_rotation[0]
-        pose.yaw = self.freecam_rotation[1]
-        pose.roll = 0.0
-        pose.fov = self._get_applied_fov(False)
-
-        speed = self.freecam_speed.value
-        if user32.GetAsyncKeyState(0x11) & 0x8000:
-            speed *= self.freecam_boost.value
-        forward = self._rotator_to_vector(pose.pitch, pose.yaw)
-        right = self._rotator_to_vector(0.0, pose.yaw + 90.0)
-        if user32.GetAsyncKeyState(ord("W")) & 0x8000:
-            pose.loc_x += forward[0] * speed
-            pose.loc_y += forward[1] * speed
-            pose.loc_z += forward[2] * speed
-        if user32.GetAsyncKeyState(ord("S")) & 0x8000:
-            pose.loc_x -= forward[0] * speed
-            pose.loc_y -= forward[1] * speed
-            pose.loc_z -= forward[2] * speed
-        if user32.GetAsyncKeyState(ord("D")) & 0x8000:
-            pose.loc_x += right[0] * speed
-            pose.loc_y += right[1] * speed
-            pose.loc_z += right[2] * speed
-        if user32.GetAsyncKeyState(ord("A")) & 0x8000:
-            pose.loc_x -= right[0] * speed
-            pose.loc_y -= right[1] * speed
-            pose.loc_z -= right[2] * speed
-        if user32.GetAsyncKeyState(0x20) & 0x8000:
-            pose.loc_z += speed
-        if user32.GetAsyncKeyState(0x10) & 0x8000:
-            pose.loc_z -= speed
-        if not self._is_reasonable_world_location(pose):
-            self.freecam_pose = fallback
-            return fallback
-        return pose
 
     def _apply_native_post_update(self, camera_ctx: int, delta: float) -> None:
         if camera_ctx < 0x10000:
             return
         current_view = self._read_pose(camera_ctx, VIEWTARGET_LOC_OFFSET, VIEWTARGET_ROT_OFFSET, VIEWTARGET_FOV_OFFSET)
         if current_view is None:
-            return
-
-        if self.freecam.value:
-            pose = self._update_freecam_pose(current_view)
-            self._write_pose(camera_ctx, VIEWTARGET_LOC_OFFSET, VIEWTARGET_ROT_OFFSET, VIEWTARGET_FOV_OFFSET, pose)
-            self._write_pose(camera_ctx, CURRENT_CACHE_LOC_OFFSET, CURRENT_CACHE_ROT_OFFSET, CURRENT_CACHE_FOV_OFFSET, pose)
-            self._write_pose(camera_ctx, LAST_FRAME_CACHE_LOC_OFFSET, LAST_FRAME_CACHE_ROT_OFFSET, LAST_FRAME_CACHE_FOV_OFFSET, pose)
-            self._mirror_pose_to_sdk(pose)
-            self._apply_viewmodel_fov()
             return
 
         desired = self._build_desired_native_ots_state(delta)
@@ -1016,8 +838,6 @@ controller = CameraController()
 @keybind("Toggle Third Person", "F5", display_name="Toggle Third Person")
 def toggle_third_person() -> None:
     controller.third_person.value = not controller.third_person.value
-    if controller.third_person.value:
-        controller.freecam.value = False
 
 
 @keybind("Toggle Shoulder Side", "F6", display_name="Toggle Shoulder Side")
@@ -1025,18 +845,9 @@ def toggle_shoulder_side() -> None:
     controller.right_shoulder.value = not controller.right_shoulder.value
 
 
-@keybind("Toggle Freecam", None, display_name="Toggle Freecam")
-def toggle_freecam() -> None:
-    controller.freecam.value = not controller.freecam.value
-    if controller.freecam.value:
-        controller.third_person.value = False
-        controller.over_shoulder.value = False
-
-
 options = controller.options() + [
     KeybindOption.from_keybind(toggle_third_person),
     KeybindOption.from_keybind(toggle_shoulder_side),
-    KeybindOption.from_keybind(toggle_freecam),
 ]
 
 mod = build_mod(
@@ -1045,7 +856,7 @@ mod = build_mod(
     version=__version__,
     description="Third-person / over-shoulder camera controls for BL4 using Python SDK plus custom AOB-scanned native hooks.",
     supported_games=Game.BL4,
-    keybinds=[toggle_third_person, toggle_shoulder_side, toggle_freecam],
+    keybinds=[toggle_third_person, toggle_shoulder_side],
     options=options,
     on_enable=controller.enable,
     on_disable=controller.disable,
