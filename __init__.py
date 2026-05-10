@@ -164,6 +164,7 @@ class CameraController:
         self.requested_first_person = False
         self.requested_third_person = False
         self.override_temporarily_blocked = False
+        self.commit_hook_suspended_for_block = False
         self.update_hook: InlineHook | None = None
         self.commit_hook: InlineHook | None = None
         self.update_callback = None
@@ -227,6 +228,7 @@ class CameraController:
         self.requested_first_person = False
         self.requested_third_person = False
         self.override_temporarily_blocked = False
+        self.commit_hook_suspended_for_block = False
 
     def _refresh_runtime_refs(self) -> None:
         pc = get_pc(possibly_loading=True)
@@ -307,9 +309,11 @@ class CameraController:
 
         def update_callback(camera_ctx: int, arg2: int, delta: float) -> int:
             try:
+                override_blocked = self._is_camera_override_blocked()
+                self._set_commit_hook_suspended_for_block(override_blocked)
                 self._update_camera_mode_requests()
                 result = self.update_original(camera_ctx, arg2, delta) if self.update_original else 0
-                if not self._is_camera_override_blocked():
+                if not override_blocked:
                     self._apply_native_post_update(camera_ctx, float(delta))
                 return int(result)
             except Exception:
@@ -344,6 +348,17 @@ class CameraController:
             return
 
         self.update_original = self.update_hook.original_function(ctypes.c_longlong, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_float)
+        self._refresh_commit_original()
+        logging.info(
+            "[BL4 Third Person Camera] Native hooks installed "
+            f"update_span=0x{update_target:X}-0x{update_target + NATIVE_CAMERA_HOOK_LEN:X} "
+            f"commit_span=0x{commit_target:X}-0x{commit_target + NATIVE_CAMERA_MODE_HOOK_LEN:X}"
+        )
+
+    def _refresh_commit_original(self) -> None:
+        if self.commit_hook is None or not self.commit_hook.trampoline:
+            self.commit_original = None
+            return
         self.commit_original = self.commit_hook.original_function(
             ctypes.c_longlong,
             ctypes.c_longlong,
@@ -352,11 +367,6 @@ class CameraController:
             ctypes.c_float,
             ctypes.c_int,
             ctypes.c_ubyte,
-        )
-        logging.info(
-            "[BL4 Third Person Camera] Native hooks installed "
-            f"update_span=0x{update_target:X}-0x{update_target + NATIVE_CAMERA_HOOK_LEN:X} "
-            f"commit_span=0x{commit_target:X}-0x{commit_target + NATIVE_CAMERA_MODE_HOOK_LEN:X}"
         )
 
     def uninstall_native_hooks(self) -> None:
@@ -368,6 +378,31 @@ class CameraController:
         self.update_hook = None
         self.update_original = None
         self.commit_original = None
+        self.commit_hook_suspended_for_block = False
+
+    def _set_commit_hook_suspended_for_block(self, should_suspend: bool) -> None:
+        if self.commit_hook is None:
+            self.commit_hook_suspended_for_block = False
+            return
+
+        if should_suspend:
+            if self.commit_hook.installed:
+                self.commit_hook.uninstall()
+                self.commit_original = None
+                logging.info("[BL4 Third Person Camera] NativeCameraModeCommit hook suspended while camera override is blocked")
+            self.commit_hook_suspended_for_block = True
+            return
+
+        if not self.commit_hook_suspended_for_block:
+            return
+
+        if self.commit_hook.install():
+            self._refresh_commit_original()
+            self.commit_hook_suspended_for_block = False
+            logging.info("[BL4 Third Person Camera] NativeCameraModeCommit hook restored after camera override block")
+        else:
+            self.commit_original = None
+            logging.error("[BL4 Third Person Camera] Failed to restore NativeCameraModeCommit hook after camera override block")
 
     def _wrapped_camera_transition(self, pc, new_mode: str, transition: str = "Default", blend_time: float = 0.15, arg4: bool = False, arg5: bool = False) -> None:
         """
@@ -377,6 +412,7 @@ class CameraController:
         was_installed = False
         if self.commit_hook is not None and self.commit_hook.installed:
             self.commit_hook.uninstall()
+            self.commit_original = None
             was_installed = True
 
         try:
@@ -385,7 +421,11 @@ class CameraController:
             pass
         finally:
             if was_installed and self.commit_hook is not None:
-                self.commit_hook.install()
+                if self.commit_hook.install():
+                    self._refresh_commit_original()
+                else:
+                    self.commit_original = None
+                    logging.error("[BL4 Third Person Camera] Failed to restore NativeCameraModeCommit hook after camera transition")
 
     def _best_effort_force_first_person(self) -> None:
         pc = self._get_pc()
